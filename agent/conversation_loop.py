@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
@@ -965,27 +966,30 @@ _CANON_ARGS_CACHE: Dict[str, str] = {}
 _CANON_ARGS_CACHE_MAX = 4096
 _CANON_ARGS_CACHE_MAX_BYTES = 32 * 1024 * 1024
 _canon_args_cache_bytes = 0
+# The gateway runs turns on a thread pool, so two sessions can canonicalize concurrently.
+# Without this lock the byte counter's read-modify-write races and the eviction loop's
+# next(iter())/pop can raise RuntimeError mid-drain, leaving the byte budget permanently
+# exceeded in a long-lived gateway.
+_CANON_ARGS_CACHE_LOCK = threading.Lock()
 
 
 def _canonicalize_tool_call_arguments(arg_str: str) -> str:
     """Canonical wire form of a tool-call arguments JSON string; raises on malformed input
     (the caller falls back to ``_repair_tool_call_arguments``)."""
     global _canon_args_cache_bytes
-    cached = _CANON_ARGS_CACHE.get(arg_str)
-    if cached is not None:
-        return cached
-    canonical = json.dumps(json.loads(arg_str), separators=(",", ":"), sort_keys=True)
-    _CANON_ARGS_CACHE[arg_str] = canonical
-    _canon_args_cache_bytes += len(arg_str) + len(canonical)
-    while len(_CANON_ARGS_CACHE) > _CANON_ARGS_CACHE_MAX or (
-        _canon_args_cache_bytes > _CANON_ARGS_CACHE_MAX_BYTES and len(_CANON_ARGS_CACHE) > 1
-    ):
-        try:
+    with _CANON_ARGS_CACHE_LOCK:
+        cached = _CANON_ARGS_CACHE.get(arg_str)
+        if cached is not None:
+            return cached
+        canonical = json.dumps(json.loads(arg_str), separators=(",", ":"), sort_keys=True)
+        _CANON_ARGS_CACHE[arg_str] = canonical
+        _canon_args_cache_bytes += len(arg_str) + len(canonical)
+        while len(_CANON_ARGS_CACHE) > _CANON_ARGS_CACHE_MAX or (
+            _canon_args_cache_bytes > _CANON_ARGS_CACHE_MAX_BYTES and len(_CANON_ARGS_CACHE) > 1
+        ):
             evicted_key = next(iter(_CANON_ARGS_CACHE))
             _canon_args_cache_bytes -= len(evicted_key) + len(_CANON_ARGS_CACHE.pop(evicted_key))
-        except (StopIteration, KeyError, RuntimeError):
-            break
-    return canonical
+        return canonical
 
 
 def _clone_message_for_send(msg):

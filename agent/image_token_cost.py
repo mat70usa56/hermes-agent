@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from contextvars import ContextVar
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +32,10 @@ _LOADED = False
 # Routed profiles (multiplexed gateway) keep their own table, loaded from THEIR cache file: the
 # module slot above is the launch profile's and would otherwise be persisted into every home.
 _LEARNED_BY_HOME: Dict[str, Dict[str, int]] = {}
+# Hot-path caches mutated from gateway turn threads: guard the lazy load and the learned writes,
+# and cap the per-home table so a long-lived multiplexer cannot grow it without bound.
+_TABLE_LOCK = threading.Lock()
+_MAX_HOME_TABLES = 64
 
 
 def _cache_path():
@@ -52,21 +57,33 @@ def _read_cache() -> Dict[str, int]:
             if isinstance(v, int) and _MIN_PLAUSIBLE <= v <= _MAX_PLAUSIBLE}
 
 
-def _table() -> Dict[str, int]:
-    """The active profile's learned table, loaded lazily from its cache file."""
+def _table_unlocked() -> Dict[str, int]:
+    """The active profile's learned table, loaded lazily from its cache file. Caller holds _TABLE_LOCK."""
     global _LOADED
     from hermes_constants import get_hermes_home_override, hermes_home_key
 
     if get_hermes_home_override() is None:
         if not _LOADED:
-            _LOADED = True
+            # Read first: a raising read must not mark the table loaded forever.
             _LEARNED.update(_read_cache())
+            _LOADED = True
         return _LEARNED
     home_key = hermes_home_key()
-    table = _LEARNED_BY_HOME.get(home_key)
+    # pop+reinsert is an LRU touch (a plain dict has no move_to_end); eviction then drops the
+    # least-recently-used home rather than the oldest-created one.
+    table = _LEARNED_BY_HOME.pop(home_key, None)
     if table is None:
-        table = _LEARNED_BY_HOME[home_key] = _read_cache()
+        while len(_LEARNED_BY_HOME) >= _MAX_HOME_TABLES:
+            _LEARNED_BY_HOME.pop(next(iter(_LEARNED_BY_HOME)))
+        table = _read_cache()
+    _LEARNED_BY_HOME[home_key] = table
     return table
+
+
+def _table() -> Dict[str, int]:
+    """The active profile's learned table, loaded lazily from its cache file."""
+    with _TABLE_LOCK:
+        return _table_unlocked()
 
 
 def learned_image_token_cost(model: Any, base_url: Any) -> int:
@@ -131,15 +148,17 @@ def calibrate_from_usage(agent: Any, messages: List[Dict[str, Any]], prompt_toke
     if not _MIN_PLAUSIBLE <= per_image <= _MAX_PLAUSIBLE:
         return None
     key = _key(getattr(agent, "model", None), getattr(agent, "base_url", None))
-    table = _table()
-    prior = table.get(key)
-    learned = per_image if prior is None else int(prior + _EMA_ALPHA * (per_image - prior))
-    table[key] = learned
+    with _TABLE_LOCK:
+        table = _table_unlocked()
+        prior = table.get(key)
+        learned = per_image if prior is None else int(prior + _EMA_ALPHA * (per_image - prior))
+        table[key] = learned
+        snapshot = dict(table)
     _image_cost_var.set(learned)
     try:
         from utils import atomic_json_write
 
-        atomic_json_write(_cache_path(), dict(table), indent=0, separators=(",", ":"))
+        atomic_json_write(_cache_path(), snapshot, indent=0, separators=(",", ":"))
     except Exception:
         logger.debug("image token cost persist failed", exc_info=True)
     logger.info(

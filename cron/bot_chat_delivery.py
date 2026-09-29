@@ -33,7 +33,33 @@ def read_pending(key: str) -> dict | None:
         return None
     if not isinstance(record, dict):
         raise ValueError(f"deferred Bot Chat receipt {key} is not a JSON object ({type(record).__name__})")
+    if not _is_valid_receipt(record):
+        raise ValueError(f"deferred Bot Chat receipt {key} is missing or has invalid required fields")
     return record
+
+
+_RECEIPT_REQUIRED_KEYS = ("id", "status", "sequence", "job", "content", "profile", "home")
+
+
+def _is_valid_receipt(record: dict) -> bool:
+    """A drainable receipt carries every field ``_drain`` indexes by name.
+
+    A structurally-valid-but-incomplete file (``{}``, a missing ``sequence``, a
+    string ``sequence``) is damage, not a receipt: replaying it raises mid-drain and
+    blocks every peer. Validate at read time so one bad file is skipped, never fatal.
+    """
+    if not all(key in record for key in _RECEIPT_REQUIRED_KEYS):
+        return False
+    return (
+        isinstance(record["id"], str)
+        and isinstance(record["status"], str)
+        and isinstance(record["sequence"], int)
+        and not isinstance(record["sequence"], bool)
+        and isinstance(record["job"], dict)
+        and isinstance(record["content"], str)
+        and isinstance(record["profile"], (str, type(None)))
+        and isinstance(record["home"], str)
+    )
 
 
 def _records(root: Path) -> list[tuple[Path, dict]]:
@@ -43,6 +69,8 @@ def _records(root: Path) -> list[tuple[Path, dict]]:
             record = json.loads(path.read_text(encoding="utf-8-sig"))
             if not isinstance(record, dict):
                 raise ValueError(f"expected a JSON object, got {type(record).__name__}")
+            if not _is_valid_receipt(record):
+                raise ValueError("missing or invalid required receipt fields")
         except (OSError, ValueError) as exc:  # ValueError: corrupt JSON and invalid UTF-8 alike
             # Keep damaged or unreadable receipts as evidence; never replay them or block peers
             # (same rule as tools/bot_live_delivery.py::_scan_read — one bad file must not wedge the dir).
@@ -103,8 +131,13 @@ def _drain(root: Path) -> None:
         records = sorted(_records(root), key=lambda item: item[1]["sequence"])
     for path, _ in records:
         with _FileLock(root / ".lock"):
-            record = json.loads(path.read_text(encoding="utf-8-sig"))
-            if not isinstance(record, dict) or record["status"] != "queued":
+            try:
+                record = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict) or not _is_valid_receipt(record):
+                continue
+            if record["status"] != "queued":
                 continue
             home = Path(record["home"])
             # A failure notice queued before the target profile opted out is settled as

@@ -244,7 +244,9 @@ class SubdirectoryHintTracker:
                 digest = _digest(content)
                 if digest in self._loaded_digests:
                     logger.debug("Skipping duplicate hint content at %s (digest %s)", hint_path, digest[:12])
-                    return None
+                    # Content-level duplicate: try the next hint filename in this directory —
+                    # returning here would hide a distinct lower-priority file (#report).
+                    continue
                 self._loaded_digests.add(digest)
                 # Same security scan as startup context loading.
                 content = _scan_context_content(content, filename)

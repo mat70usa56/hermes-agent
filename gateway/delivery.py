@@ -30,6 +30,21 @@ _SILENCE_NARRATION = re.compile(
 _THREAD_ROUTING_KEYS = ("thread_id", "message_thread_id", "direct_messages_topic_id", "telegram_direct_messages_topic_id")
 
 
+def _safe_job_component(job_id: Optional[str], default: str = "misc") -> str:
+    """Filesystem-safe component derived from a job id.
+
+    Ids are normally ``uuid4().hex[:12]``, but imported/merged job stores accept an arbitrary
+    ``id``; without this an id containing ``../`` or an absolute path escapes the cron output
+    directory on write."""
+    raw = str(job_id or "").strip()
+    if not raw:
+        return default
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
+    if not cleaned.strip("."):
+        return default
+    return cleaned[:128]
+
+
 def _is_silence_narration(content: Optional[str]) -> bool:
     """True when ``content`` is *only* a silence-narration token (length-guarded)."""
     stripped = content.strip() if content else ""
@@ -202,7 +217,7 @@ class DeliveryRouter:
                        metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """Save content to local files."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = self.output_dir / (job_id or "misc") / f"{timestamp}.md"
+        output_path = self.output_dir / _safe_job_component(job_id) / f"{timestamp}.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         lines = [f"# {job_name}" if job_name else "# Delivery Output", "",
                  f"**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"]
@@ -214,7 +229,7 @@ class DeliveryRouter:
     def _save_full_output(self, content: str, job_id: str) -> Path:
         """Save full cron output to disk and return the file path."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = get_hermes_home() / "cron" / "output" / f"{job_id}_{timestamp}.txt"
+        path = get_hermes_home() / "cron" / "output" / f"{_safe_job_component(job_id)}_{timestamp}.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         return path

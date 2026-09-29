@@ -2098,6 +2098,10 @@ class GatewayNotificationsMixin:
                       session_id, interval, notify_mode, agent_notify)
         silent = notify_mode == "off" and not agent_notify
         last_output_len = 0
+        # Bounded retry for a terminal process whose adapter injection keeps failing: without a
+        # cap the watcher spins forever, including through a long shutdown.
+        delivery_failures = 0
+        max_delivery_failures = 20
         while True:
             await asyncio.sleep(interval)
             session = process_registry.get(session_id)
@@ -2125,8 +2129,17 @@ class GatewayNotificationsMixin:
                     delivered = await self._enqueue_process_completion_notification(synth_text, completion_evt)
                     if delivered is False:
                         # The process remains terminal; retry after failed adapter injection instead
-                        # of suppressing the result.
+                        # of suppressing the result. Bounded so a permanently failing transport cannot
+                        # spin the watcher forever.
+                        delivery_failures += 1
+                        if delivery_failures > max_delivery_failures:
+                            logger.warning(
+                                "Process watcher: giving up on completion notification for %s after %d failed injections",
+                                session_id, delivery_failures,
+                            )
+                            break
                         continue
+                    delivery_failures = 0
                     # The agent normally reports the result itself, so the chat gets no separate receipt.
                     # While the launching turn is still running the injection only queues a follow-up, and
                     # the chat would stay mute for as long as that turn lasts (#112033): send the concise

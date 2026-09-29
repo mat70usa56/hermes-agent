@@ -32,6 +32,23 @@ def _is_image_part(part: Any) -> bool:
     return isinstance(part, dict) and part.get("type") in _IMAGE_PART_TYPES
 
 
+def _run_coro_sync(coro: Any) -> Any:
+    """Run ``coro`` from sync code, whether or not an event loop is already running.
+
+    A raw ``asyncio.run`` raises ``RuntimeError`` on a loop thread (gateway/tui hosts),
+    silently degrading vision to "Image analysis failed"; offload to a worker thread with
+    the caller's contextvars copied (same shape as ``preprocess_context_references``)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import concurrent.futures
+    import contextvars
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(contextvars.copy_context().run, asyncio.run, coro).result()
+
+
 def _salvage_text_parts(content: list, *, any_dict_text: bool) -> List[str]:
     """Stripped, non-empty text from string parts and text-typed dict parts (or any dict's
     ``text`` when ``any_dict_text``), in order."""
@@ -111,7 +128,7 @@ class VisionMessagePrepMixin:
         try:
             from tools.vision_tools import vision_analyze_tool
 
-            result_json = asyncio.run(vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt))
+            result_json = _run_coro_sync(vision_analyze_tool(image_url=vision_source, user_prompt=analysis_prompt))
             result = json.loads(result_json) if isinstance(result_json, str) else {}
             description = (result.get("analysis") or "").strip()
         except Exception as e:

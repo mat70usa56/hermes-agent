@@ -163,6 +163,9 @@ class LSPClient:
         self._cleanup_lock = asyncio.Lock()
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
+        # Retain in-flight server→client request tasks: asyncio holds only weak refs, so an
+        # unreferenced task can be GC'd mid-flight and its exception never retrieved.
+        self._dispatch_tasks: set = set()
 
         # Server → client requests; anything else gets method-not-found.  Capability (un)registration
         # and diagnostic refresh are acknowledged but not acted on: we re-pull on every touch anyway.
@@ -322,11 +325,19 @@ class LSPClient:
         if kind == "response":
             self._dispatch_response(key, msg)
         elif kind == "request":
-            asyncio.create_task(self._dispatch_request(key, msg))
+            task = asyncio.create_task(self._dispatch_request(key, msg))
+            self._dispatch_tasks.add(task)
+            task.add_done_callback(self._on_dispatch_task_done)
         elif kind == "notification":
             self._dispatch_notification(key, msg)
         else:
             logger.warning("[%s] dropping invalid message: %r", self.server_id, msg)
+
+    def _on_dispatch_task_done(self, task: asyncio.Task) -> None:
+        """Drop the strong ref and consume any exception so it is never 'never retrieved'."""
+        self._dispatch_tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.warning("[%s] server request handler failed: %s", self.server_id, exc)
 
     async def _reader_loop(self) -> None:
         if self._proc is None or self._proc.stdout is None:

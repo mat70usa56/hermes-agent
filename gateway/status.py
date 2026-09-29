@@ -1078,8 +1078,15 @@ def acquire_gateway_runtime_lock() -> bool:
     try:
         handle = open(path, "a+", encoding="utf-8")
     except PermissionError:
-        # Stale root-owned lock (launchd session that ran as root): the directory owner can
-        # unlink it; retry once with a fresh file.
+        # Root-owned lock we cannot open. Never steal one that may be live: a live recorded owner
+        # (start-time guarded), or an unreadable file young enough to be mid-write, means "held".
+        # A genuinely stale lock (dead owner, or unreadable and past the write-grace window) is
+        # reclaimed so launchd's root-owned leftovers still recover (#42685).
+        record = _read_json_file(path, bare_pid_ok=True)
+        if record is not None and _live_pid_from_record(record) is not None:
+            return False
+        if record is None and _lock_file_within_write_grace(path):
+            return False
         try:
             path.unlink()
             handle = open(path, "a+", encoding="utf-8")
@@ -1139,7 +1146,13 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     try:
         handle = open(resolved_lock_path, "a+", encoding="utf-8")
     except PermissionError:
-        # Stale root-owned lock (see acquire_gateway_runtime_lock): report inactive.
+        # A root-owned lock we cannot open for append: only reclaim it when its recorded owner
+        # is provably dead (start-time PID-reuse guarded). Unlinking a live root-owned lock would
+        # let a second gateway acquire the runtime lock while the first still runs; fail closed
+        # (active) when unreadable.
+        record = _read_json_file(resolved_lock_path, bare_pid_ok=True)
+        if record is None or _live_pid_from_record(record) is not None:
+            return True
         _unlink_quietly(resolved_lock_path)
         return False
     return _probe_lock_file(handle)
@@ -1646,6 +1659,57 @@ def _process_is_stopped(pid: int) -> bool:
     return False
 
 
+_SCOPED_LOCK_WRITE_GRACE_S = 5.0
+
+
+def _lock_file_within_write_grace(lock_path: Path, *, grace_s: float = _SCOPED_LOCK_WRITE_GRACE_S) -> bool:
+    """True while an unreadable lock file is young enough to be a live writer mid-``json.dump()``."""
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except OSError:
+        return False
+    return age < grace_s
+
+
+def _reclaim_stale_lock_file(lock_path: Path) -> bool:
+    """Claim and remove a stale/empty scoped lock file without stealing a fresh one.
+
+    The read→rename sequence is not atomic, and neither inode identity nor a re-read of
+    ``lock_path`` is reliable (freed inodes are reused, and a racer can replace the file at any
+    point). Rename the file to a PRIVATE tombstone first — nobody else can touch that name — and
+    RE-EVALUATE staleness there: a live record, or an empty file still inside the write-grace
+    window, is put back (non-clobbering ``os.link``) and reported as contention. This closes the
+    whole read→rename window in one step. Returns True when this caller reclaimed the file."""
+    tombstone = lock_path.with_name(f"{lock_path.name}.stale.{os.getpid()}.{time.time_ns()}")
+    try:
+        os.replace(lock_path, tombstone)
+    except OSError:
+        return False  # another racer already renamed it (or it vanished); O_EXCL decides
+    try:
+        record = _read_json_file(tombstone)
+        if record is None:
+            # Empty/invalid: stale only once the writer that owned it is clearly gone.
+            reclaim = not _lock_file_within_write_grace(tombstone)
+        else:
+            reclaim = _scoped_lock_record_is_stale(record, _pid_from_record(record))
+        if reclaim:
+            _unlink_quietly(tombstone)
+            return True
+        # A live lock we grabbed by mistake: put it back without clobbering a newer racer's file.
+        try:
+            os.link(tombstone, lock_path)
+        except FileExistsError:
+            pass  # someone created a lock while it was renamed away — leave theirs
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.replace(tombstone, lock_path)  # best effort restore on filesystems without link
+        _unlink_quietly(tombstone)
+        return False
+    except Exception:
+        _unlink_quietly(tombstone)
+        return False
+
+
 def acquire_scoped_lock(
     scope: str, identity: str, metadata: Optional[dict[str, Any]] = None
 ) -> tuple[bool, Optional[dict[str, Any]]]:
@@ -1663,8 +1727,14 @@ def acquire_scoped_lock(
         record["profile"] = profile
     existing = _read_json_file(lock_path)
     if existing is None and lock_path.exists():
-        # Empty/invalid JSON: previous process died between O_EXCL create and json.dump().
-        _unlink_quietly(lock_path)
+        # Empty/invalid JSON: a previous writer may have died between _write_json_excl's O_EXCL
+        # create and json.dump(), OR a live racer is mid-dump right now (the file is 0-byte until
+        # the dump completes). Never touch a young file; beyond the grace window, reclaim it by
+        # identity so a fresh lock that replaced it meanwhile is put back, not stolen.
+        if _lock_file_within_write_grace(lock_path):
+            return False, None
+        if not _reclaim_stale_lock_file(lock_path):
+            return False, _read_json_file(lock_path)
     if existing:
         existing_pid = _pid_from_record(existing)
         # Our own PID: always self-reacquire. start_time guards reuse of OTHER PIDs; requiring
@@ -1680,13 +1750,11 @@ def acquire_scoped_lock(
             return True, existing
         if not _scoped_lock_record_is_stale(existing, existing_pid):
             return False, existing
-        # Rename to a tombstone instead of unlink(): with unlink()+O_EXCL two racing starters
-        # could both win. os.replace() lets exactly one claim it; a failed replace means another
-        # racer claimed it and O_EXCL below decides.
-        with contextlib.suppress(OSError):
-            tombstone = lock_path.with_name(lock_path.name + ".stale")
-            os.replace(lock_path, tombstone)
-            _unlink_quietly(tombstone)
+        # Reclaim by identity: if a racer installed a fresh lock between our staleness read and
+        # the rename, _reclaim_stale_lock_file puts it back and we report contention instead of
+        # stealing it (the old fixed-name tombstone could rename a live lock away).
+        if not _reclaim_stale_lock_file(lock_path):
+            return False, _read_json_file(lock_path)
     try:
         _write_json_excl(lock_path, record)
     except FileExistsError:

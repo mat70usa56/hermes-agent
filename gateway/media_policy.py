@@ -15,6 +15,8 @@ import logging
 import os
 from typing import Any, Dict, Optional
 
+from gateway.config import _coerce_bool
+
 logger = logging.getLogger(__name__)
 
 _FLAG_ENVS = (("strict", "HERMES_MEDIA_DELIVERY_STRICT"), ("trust_recent_files", "HERMES_MEDIA_TRUST_RECENT_FILES"))
@@ -41,7 +43,7 @@ def _routed_gateway_cfg() -> Optional[Dict[str, Any]]:
 def media_delivery_strict() -> bool:
     cfg = _routed_gateway_cfg()
     if cfg is not None:
-        return bool(cfg.get("strict", False))
+        return _coerce_bool(cfg.get("strict"), False)
     return os.environ.get(_FLAG_ENVS[0][1], "0").strip().lower() in _TRUTHY
 
 
@@ -56,7 +58,7 @@ def media_delivery_allow_dirs() -> str:
 def media_delivery_trust_recent() -> bool:
     cfg = _routed_gateway_cfg()
     if cfg is not None:
-        return bool(cfg.get("trust_recent_files", True))
+        return _coerce_bool(cfg.get("trust_recent_files"), True)
     return os.environ.get(_FLAG_ENVS[1][1], "1").strip().lower() not in ("0", "false", "no", "off", "")
 
 
@@ -104,7 +106,7 @@ def apply_media_policy_env(config: Optional[Dict[str, Any]] = None) -> None:
         for key, env in _FLAG_ENVS:
             flag = gateway_cfg.get(key)
             if flag is not None:
-                _set_env_default(env, "1" if flag else "0")
+                _set_env_default(env, "1" if _coerce_bool(flag) else "0")
         allow_dirs = gateway_cfg.get("media_delivery_allow_dirs")
         if allow_dirs:
             _set_env_default(_ALLOW_DIRS_ENV, _allow_dirs_str(allow_dirs))

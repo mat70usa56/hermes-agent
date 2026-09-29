@@ -11,7 +11,9 @@ partial bytes. Used by the streaming error-body sites: native Gemini, Gemini Clo
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import socket
 import threading
 from typing import List
 
@@ -23,6 +25,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_ERROR_BODY_MAX_BYTES = 64 * 1024
 # Hard deadline for the whole read; past it the connection is closed and the partial bytes are kept.
 DEFAULT_ERROR_BODY_TIMEOUT_S = 10.0
+
+
+def _shutdown_response_socket(response: httpx.Response) -> None:
+    """Best-effort ``shutdown(SHUT_RDWR)`` on the response's network socket. FD-safe from any
+    thread (no close); lets a read blocked inside the kernel notice the timeout. Benign when the
+    stream/socket is unavailable or already torn down."""
+    try:
+        stream = (getattr(response, "extensions", None) or {}).get("network_stream")
+        if stream is None:
+            return
+        sock = stream.get_extra_info("socket")
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            sock.settimeout(0)
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:  # noqa: BLE001 - diagnostic path must not raise
+        pass
 
 
 def read_streaming_error_body(
@@ -66,6 +86,9 @@ def read_streaming_error_body(
             "bounded error-body read: hard timeout after %.1fs (%d bytes so far)",
             timeout_s, sum(len(c) for c in chunks),
         )
+    # Force any C-level socket read to unwind: close() alone may not unblock a read already
+    # stuck in the kernel, and the daemon drain thread would linger with its buffers.
+    _shutdown_response_socket(response)
     # Closing cancels any in-flight socket read so the worker unwinds. No join (daemon, may be blocked in C).
     try:
         response.close()
