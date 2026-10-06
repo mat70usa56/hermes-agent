@@ -49,6 +49,7 @@ _registered_lock = threading.Lock()
 _delivery_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 _worker_lock = threading.Lock()
 _worker: Optional[threading.Thread] = None
+_atexit_registered = False
 
 
 @dataclass
@@ -264,7 +265,7 @@ def _build_delivery(event: str, target: WebhookTarget, body: bytes, delivery_id:
 
 
 def _enqueue(delivery: Dict[str, Any]) -> None:
-    global _worker
+    global _worker, _atexit_registered
     if _worker is None or not _worker.is_alive():
         with _worker_lock:
             if _worker is None or not _worker.is_alive():
@@ -272,7 +273,10 @@ def _enqueue(delivery: Dict[str, Any]) -> None:
                 _worker.start()
                 # Daemon worker: a short-lived process could exit right after enqueuing on_session_end.
                 # Drain at interpreter shutdown, bounded so a dead endpoint can only delay exit, never hang it.
-                atexit.register(flush, timeout=5.0)
+                # Register ONCE: a restarted worker must not stack another flush callback per restart.
+                if not _atexit_registered:
+                    _atexit_registered = True
+                    atexit.register(flush, timeout=5.0)
     try:
         _delivery_queue.put_nowait(delivery)
     except queue.Full:

@@ -26,6 +26,7 @@ MAX_DIFF_CHARS = 4000
 MAX_OUTPUT_CHARS = 8000
 URL_TIMEOUT_SECONDS = 30
 MAX_URL_BYTES = 262_144  # 256 KiB
+_MAX_URL_REDIRECTS = 5
 
 _SNAPSHOT_FILENAME = "monitor_last_output.txt"
 
@@ -86,16 +87,47 @@ def _write_last_output(job_id: str, output: str) -> None:
 
 
 def _fetch_monitor_url(url: str) -> tuple[bool, str]:
-    """Bounded GET of a monitor URL. Returns (ok, body-or-error)."""
-    import urllib.request
+    """Bounded GET of a monitor URL. Returns (ok, body-or-error).
+
+    SSRF-guarded: uses the shared URL-safety policy *and* the SSRF-safe httpx client, whose
+    transport re-resolves and validates at TCP-connect and dials the vetted IP (closing the DNS
+    rebinding gap a pre-flight check alone leaves open). Redirects are followed manually so every
+    hop is validated."""
+    from urllib.parse import urljoin
+
+    from tools.url_safety import create_ssrf_safe_client, is_safe_url
 
     if not str(url).lower().startswith(("http://", "https://")):
         return False, f"monitor_url must be http(s): {url!r}"
+    if not is_safe_url(url):
+        return False, f"monitor_url blocked by URL-safety policy (private/internal target): {url!r}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "hermes-cron-monitor"})
-        with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as resp:  # nosec B310 — scheme checked above
-            body = resp.read(MAX_URL_BYTES + 1)
-        return True, body[:MAX_URL_BYTES].decode("utf-8", errors="replace")
+        current = url
+        with create_ssrf_safe_client(timeout=URL_TIMEOUT_SECONDS, follow_redirects=False) as client:
+            for _ in range(_MAX_URL_REDIRECTS + 1):
+                with client.stream("GET", current, headers={"User-Agent": "hermes-cron-monitor"}) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location")
+                        nxt = urljoin(str(resp.url), location) if location else None
+                        if not nxt or not is_safe_url(nxt):
+                            return False, f"monitor_url redirect blocked: {nxt!r}"
+                        current = nxt
+                        continue
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes():
+                        if not chunk:
+                            continue
+                        remaining = MAX_URL_BYTES - total
+                        if remaining <= 0:
+                            break
+                        chunks.append(chunk[:remaining])
+                        total += len(chunk)
+                        if total >= MAX_URL_BYTES:
+                            break
+                    return True, b"".join(chunks).decode("utf-8", errors="replace")
+            return False, f"monitor_url fetch failed: too many redirects ({_MAX_URL_REDIRECTS} max)"
     except Exception as exc:
         return False, f"monitor_url fetch failed: {exc}"
 

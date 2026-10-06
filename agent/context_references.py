@@ -431,7 +431,9 @@ def _run_quiet(cmd: list[str], cwd: Path, timeout: int, env: dict | None = None)
         proc.wait()
         raise subprocess.TimeoutExpired(cmd, timeout)
     for thread in threads:
-        thread.join()
+        # Bounded join: a grandchild that inherited the pipe and outlived the killed ``git`` can
+        # keep a drain thread blocked in read1 forever; the threads are daemons, so move on.
+        thread.join(timeout=2.0)
     stdout, stderr = (b"".join(sink).decode("utf-8", "replace") for sink in sinks)
     returncode = proc.returncode
     if truncated.is_set() and returncode == 0:
@@ -460,7 +462,11 @@ async def _fetch_url_content(url: str, *, url_fetcher: UrlFetcher = None) -> str
 
 async def _default_url_fetcher(url: str) -> str:
     from tools.web_tools import web_extract_tool
-    docs = json.loads(await web_extract_tool([url], format="markdown")).get("results", [])
+    raw = await web_extract_tool([url], format="markdown")
+    # The tool contract is a JSON string, but accept a mapping too so tool-contract drift
+    # degrades to an empty result instead of raising and dropping every @url: reference.
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    docs = data.get("results", []) if isinstance(data, dict) else []
     return str(docs[0].get("content") or docs[0].get("raw_content") or "").strip() if docs else ""
 
 

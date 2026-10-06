@@ -245,7 +245,11 @@ def nous_rate_limit_guard(
             from hermes_cli.anon_auth import apply_model_switch
             apply_model_switch(agent)
         except Exception:
-            pass
+            logger.debug("nous rate guard: apply_model_switch failed", exc_info=True)
+        # Fail-open, but LOUD: a bare ``pass`` here silently retried the still rate-limited
+        # primary with the accepted user row lost. The guard sits outside the API-error ``try``
+        # in _run_api_retry_loop, so every failure in this function must be caught here or the
+        # turn aborts.
         try:
             from agent.nous_rate_guard import (
                 nous_rate_limit_remaining, format_remaining as _fmt_nous_remaining
@@ -253,7 +257,11 @@ def nous_rate_limit_guard(
             from hermes_cli import anon_auth
             _anonymous = anon_auth.is_anonymous_agent(agent)
             _nous_remaining = nous_rate_limit_remaining(anonymous=_anonymous)
-            if _nous_remaining is not None and _nous_remaining > 0:
+        except Exception:
+            logger.warning("nous rate guard probe failed; continuing without it", exc_info=True)
+            _nous_remaining = None
+        if _nous_remaining is not None and _nous_remaining > 0:
+            try:
                 reset = _fmt_nous_remaining(_nous_remaining)
                 if _anonymous:
                     _nous_msg = anon_auth.FREE_TIER_RATE_LIMIT_CHAT.format(
@@ -270,7 +278,12 @@ def nous_rate_limit_guard(
                     return _verdict("break")
                 # No fallback — surface the buffered rate-limit context that led here.
                 agent._flush_status_buffer()
-                agent._persist_session(messages, conversation_history)
+                try:
+                    agent._persist_session(messages, conversation_history)
+                except Exception:
+                    # A persist failure must not discard the rate-limit verdict and silently
+                    # retry the still rate-limited primary.
+                    logger.error("nous rate guard: persist after rate limit failed", exc_info=True)
                 # The free tier's sentence already says what to do (wait, or sign in); the
                 # fallback-provider advice is for an install that runs its own providers.
                 return _verdict("return", stamp_failure({
@@ -285,6 +298,6 @@ def nous_rate_limit_guard(
                     **({"free_tier": {"kind": "rate_limited", "message": anon_auth.FREE_TIER_RATE_LIMIT_CARD.format(
                         reset=anon_auth.friendly_wait(_nous_remaining))}} if _anonymous else {}),
                 }, FailoverReason.rate_limit.value, True))
-        except Exception:
-            pass  # Never let rate guard break the agent loop
+            except Exception:
+                logger.error("nous rate guard: fallback/persist after rate limit failed", exc_info=True)
     return _verdict("fallthrough")

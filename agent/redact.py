@@ -1262,12 +1262,15 @@ def _has_known_prefix_substring(text: str) -> bool:
 # There is deliberately no public removal API — additive-only stands; unload is a host-owned lifecycle
 # concern. See #64229.
 _PLUGIN_PREFIX_PATTERNS: dict = {}
-_registry_lock = threading.Lock()
+# Reentrant: _plugin_patterns() is called both standalone and from _rebuild_prefix_matcher(),
+# which already holds this lock.
+_registry_lock = threading.RLock()
 
 
 def _plugin_patterns() -> list:
-    """All plugin-registered patterns in registration order."""
-    return [p for patterns in _PLUGIN_PREFIX_PATTERNS.values() for p in patterns]
+    """All plugin-registered patterns in registration order (lock-guarded snapshot)."""
+    with _registry_lock:
+        return [p for patterns in _PLUGIN_PREFIX_PATTERNS.values() for p in patterns]
 
 
 def _rebuild_prefix_matcher() -> None:

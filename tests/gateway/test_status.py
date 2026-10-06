@@ -963,6 +963,63 @@ class TestScopedLocks:
         # The winner's fresh lock must be untouched on disk.
         assert json.loads(lock_path.read_text())["pid"] == 424242
 
+    def test_acquire_scoped_lock_reclaims_only_the_inspected_file(self, tmp_path, monkeypatch):
+        """The rename must never steal a fresh lock installed between our staleness read and the
+        rename. Injects the winner's install inside the staleness check (the real read→rename
+        window) and asserts the fresh lock is re-validated on the tombstone and put back."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({"pid": 99999, "start_time": 123, "kind": "hermes-gateway"}))
+
+        fresh_record = {"pid": 424242, "start_time": 456, "kind": "hermes-gateway", "scope": "telegram-bot-token"}
+        state = {"installed": False}
+
+        def racing_stale(record, pid):
+            if not state["installed"] and isinstance(record, dict) and record.get("pid") == 99999:
+                # Winner removes the stale file and O_EXCL-creates its own (a NEW inode) right
+                # after our staleness read, before our reclaim rename runs.
+                state["installed"] = True
+                lock_path.unlink()
+                lock_path.write_text(json.dumps(fresh_record))
+                return True
+            return isinstance(record, dict) and record.get("pid") == 99999
+
+        monkeypatch.setattr(status, "_scoped_lock_record_is_stale", racing_stale)
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
+
+        assert acquired is False, (acquired, existing)
+        assert existing is not None and existing["pid"] == 424242, existing
+        assert json.loads(lock_path.read_text())["pid"] == 424242
+
+    def test_acquire_scoped_lock_young_empty_file_is_contention(self, tmp_path, monkeypatch):
+        """A 0-byte lock with a fresh mtime is a live writer mid-dump; never touch it."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("")
+        os.utime(lock_path, None)
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret")
+
+        assert acquired is False and existing is None
+        assert lock_path.exists(), "a young empty lock must not be deleted or renamed"
+
+    def test_acquire_scoped_lock_reclaims_old_empty_file(self, tmp_path, monkeypatch):
+        """A 0-byte lock older than the write-grace window is a dead writer and is reclaimed."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("")
+        old = time.time() - status._SCOPED_LOCK_WRITE_GRACE_S - 5
+        os.utime(lock_path, (old, old))
+
+        acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret")
+
+        assert acquired is True
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+
 
     def test_acquire_scoped_lock_replaces_stale_record(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
@@ -1511,12 +1568,14 @@ class TestPermissionErrorOnLockFile:
     """Stale root-owned lock files from launchd Background sessions must not
     crash the gateway on restart (issue #42685)."""
 
-    def test_permission_error_on_lock_file_returns_false_and_removes(self, tmp_path, monkeypatch):
-        """When the lock file is not writable (root-owned), the function should
-        remove the stale file and report the lock as inactive."""
+    def test_permission_error_reclaims_lock_with_dead_owner(self, tmp_path, monkeypatch):
+        """A root-owned lock whose recorded owner is dead is reclaimed and reported inactive."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         lock_path = tmp_path / "gateway.lock"
-        lock_path.write_text("stale", encoding="utf-8")
+        lock_path.write_text(
+            json.dumps({"pid": 99999, "start_time": 123, "kind": "hermes-gateway"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
 
         real_open = open
 
@@ -1531,12 +1590,35 @@ class TestPermissionErrorOnLockFile:
         assert result is False
         assert not lock_path.exists(), "stale root-owned lock file should be removed"
 
-    def test_permission_error_unlink_failure_still_returns_false(self, tmp_path, monkeypatch):
-        """Even if unlinking the stale lock file fails (e.g. directory not writable),
-        the function should still return False to allow startup."""
+    def test_permission_error_without_provably_dead_owner_fails_closed(self, tmp_path, monkeypatch):
+        """An unreadable root-owned lock with no provably-dead owner must report active:
+        unlinking it could delete a live gateway's runtime lock."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         lock_path = tmp_path / "gateway.lock"
         lock_path.write_text("stale", encoding="utf-8")
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            if str(path) == str(lock_path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+
+        result = status.is_gateway_runtime_lock_active(lock_path)
+        assert result is True
+        assert lock_path.exists(), "a lock that may belong to a live gateway must be left in place"
+
+    def test_permission_error_dead_owner_unlink_failure_still_returns_false(self, tmp_path, monkeypatch):
+        """A dead-owner lock is reported inactive even if unlinking it fails
+        (e.g. directory not writable)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = tmp_path / "gateway.lock"
+        lock_path.write_text(
+            json.dumps({"pid": 99999, "start_time": 123, "kind": "hermes-gateway"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
 
         real_open = open
 
@@ -1558,6 +1640,30 @@ class TestPermissionErrorOnLockFile:
         result = status.is_gateway_runtime_lock_active(lock_path)
         assert result is False
 
+    def test_permission_error_with_live_owner_reports_active(self, tmp_path, monkeypatch):
+        """An unreadable root-owned lock whose recorded owner is provably alive must stay active:
+        it must NOT be reclaimed."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = tmp_path / "gateway.lock"
+        lock_path.write_text(
+            json.dumps({"pid": 424242, "start_time": 456, "kind": "hermes-gateway"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 456)
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            if str(path) == str(lock_path):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+
+        result = status.is_gateway_runtime_lock_active(lock_path)
+        assert result is True
+        assert lock_path.exists(), "a live owner's lock must not be removed"
+
     def test_acquire_gateway_runtime_lock_recovers_from_permission_error(self, tmp_path, monkeypatch):
         """acquire_gateway_runtime_lock must survive a stale root-owned lock
         file: unlink it and retry with a fresh file instead of crashing."""
@@ -1565,6 +1671,9 @@ class TestPermissionErrorOnLockFile:
         lock_path = status._get_gateway_lock_path()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_path.write_text("stale", encoding="utf-8")
+        # A genuinely stale lock, not a live writer mid-dump: age it past the write-grace window.
+        old = time.time() - status._SCOPED_LOCK_WRITE_GRACE_S - 5
+        os.utime(lock_path, (old, old))
 
         real_open = open
 
@@ -1586,6 +1695,31 @@ class TestPermissionErrorOnLockFile:
             assert status.acquire_gateway_runtime_lock() is True
         finally:
             status.release_gateway_runtime_lock()
+
+    def test_acquire_gateway_runtime_lock_does_not_steal_young_unreadable_lock(self, tmp_path, monkeypatch):
+        """A young, unreadable root-owned lock could belong to a live writer/holder: acquisition
+        must fail closed instead of unlinking it."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = status._get_gateway_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("stale", encoding="utf-8")
+        os.utime(lock_path, None)  # fresh mtime -> inside the write-grace window
+
+        real_open = open
+
+        def deny_write(path, *args, **kwargs):
+            if (
+                str(path) == str(lock_path)
+                and lock_path.exists()
+                and lock_path.read_text(encoding="utf-8") == "stale"
+            ):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", deny_write)
+
+        assert status.acquire_gateway_runtime_lock() is False
+        assert lock_path.exists(), "a young unreadable lock must be left in place"
 
 
 class TestNormalizeUpdatedAt:

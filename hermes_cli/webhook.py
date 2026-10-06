@@ -70,6 +70,14 @@ def _route_url(name: str, route: dict) -> str:
     return f"{_get_webhook_base_url()}{prefix}/webhooks/{name}"
 
 
+def _mask_secret(secret: str) -> str:
+    """Mask an HMAC secret for terminal output, showing only enough to identify it."""
+    value = secret or ""
+    if len(value) <= 8:
+        return "****"
+    return f"{value[:4]}…{value[-4:]}"
+
+
 def _setup_hint() -> str:
     _dhh = display_hermes_home()
     return f"""
@@ -186,7 +194,9 @@ def _cmd_subscribe(args):
     print(f"\n  {'Updated' if is_update else 'Created'} webhook subscription: {name}")
     print(f"  URL:    {_route_url(name, route)}")
     print(f"  Profile: {profile}")
-    print(f"  Secret: {secret}")
+    print(f"  Secret: {secret if getattr(args, 'show_secret', False) else _mask_secret(secret)}")
+    if not getattr(args, "show_secret", False):
+        print("          (masked; re-run with --show-secret to reveal, then store it in your service)")
     print(f"  Events: {', '.join(events) or '(all)'}")
     print(f"  Deliver: {route['deliver']}")
     if route.get("deliver_only"):
